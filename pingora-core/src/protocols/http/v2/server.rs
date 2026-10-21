@@ -1815,6 +1815,21 @@ mod test {
         }
     }
 
+    /// A client request with conflicting duplicate `content-length` values.
+    fn conflicting_content_length_request() -> Request<()> {
+        Request::builder()
+            .method(Method::GET)
+            .uri("https://www.example.com/")
+            .header("content-length", "5")
+            .header("content-length", "6")
+            .body(())
+            .unwrap()
+    }
+
+    // Conflicting Content-Length values are unrecoverable framing. The h2 codec
+    // refuses them itself: it resets the stream with PROTOCOL_ERROR before the
+    // request is handed to Pingora, so the stream never reaches acceptance,
+    // and the rest of the connection is unaffected.
     #[tokio::test]
     async fn test_req_conflicting_content_length_rejected() {
         let (client, server) = duplex(65536);
@@ -1826,56 +1841,80 @@ mod test {
             });
             let mut h2 = h2.ready().await.unwrap();
 
-            // Conflicting duplicate Content-Length values: unrecoverable framing.
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("https://www.example.com/")
-                .header("content-length", "5")
-                .header("content-length", "6")
-                .body(())
+            let (response, mut req_body) = h2
+                .send_request(conflicting_content_length_request(), false)
                 .unwrap();
-
-            let (response, mut req_body) = h2.send_request(request, false).unwrap();
-            // Send a body matching the first Content-Length value so the h2
-            // codec accepts the stream and Pingora's duplicate-CL validation is
-            // what rejects the request.
+            // A body matching the first value: the stream is refused for its
+            // headers alone.
             req_body.reserve_capacity(5);
             req_body.send_data("abcde".into(), true).unwrap();
 
-            // The server must reject the stream with PROTOCOL_ERROR rather than
-            // surface the request to the application.
             let err = response.await.unwrap_err();
             assert_eq!(err.reason(), Some(h2::Reason::PROTOCOL_ERROR));
-            // Dropping `h2` lets the connection close so the server loop exits.
+
+            // The reset is stream-local: a valid request on the same connection
+            // is served.
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/valid")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(request, true).unwrap();
+            assert_eq!(response.await.unwrap().status(), StatusCode::NO_CONTENT);
         });
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
+        let mut malformed_streams = 0usize;
 
-        // The malformed stream is reset during acceptance, so it is reported as
-        // rejected rather than surfaced to the application as a session.
-        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
-            .await
+        // The first stream the application sees is the valid one: the malformed
+        // stream surfaced neither as a session nor as a Pingora rejection.
+        let accepted = timeout(
+            Duration::from_secs(5),
+            HttpSession::from_h2_conn_with_malformed_budget(
+                &mut connection,
+                digest.clone(),
+                &mut malformed_streams,
+            ),
+        )
+        .await
+        .expect("from_h2_conn hung")
+        .unwrap();
+        let Some(H2Accept::Session(mut session)) = accepted else {
+            panic!("expected the valid request as the first accepted stream");
+        };
+        assert_eq!(session.req_header().uri.path(), "/valid");
+        assert_eq!(malformed_streams, 0, "h2 refused the stream, not Pingora");
+        session
+            .write_response_header(
+                Box::new(ResponseHeader::build(StatusCode::NO_CONTENT, Some(0)).unwrap()),
+                true,
+            )
             .unwrap();
-        assert!(
-            matches!(accepted, Some(H2Accept::Rejected)),
-            "malformed request must not surface as a session"
-        );
+        drop(session);
 
         let done = timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(5),
             HttpSession::from_h2_conn(&mut connection, digest),
         )
         .await
-        .expect("from_h2_conn hung after rejecting malformed request")
-        .expect("from_h2_conn returned an error after rejecting malformed request");
-        assert!(done.is_none(), "connection should close after rejection");
+        .expect("from_h2_conn hung after the valid request")
+        .expect("from_h2_conn returned an error after the valid request");
+        assert!(done.is_none(), "connection should close after the client");
 
         client_task.await.unwrap();
     }
 
+    // Streams refused by the h2 codec are bounded per connection by h2's own
+    // limit on locally reset streams: a flood of conflicting Content-Length
+    // requests ends in a connection error (GOAWAY ENHANCE_YOUR_CALM) and none
+    // of them reaches the application.
     #[tokio::test]
     async fn test_req_malformed_stream_budget_exhausted() {
+        // h2's default limit is 1024; set it explicitly so the test pins the
+        // bound rather than the default.
+        const LIMIT: usize = 64;
         let (client, server) = duplex(65536);
 
         let client_task = tokio::spawn(async move {
@@ -1883,43 +1922,73 @@ mod test {
             tokio::spawn(async move {
                 let _ = connection.await;
             });
-            let mut h2 = h2.ready().await.unwrap();
-
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("https://www.example.com/")
-                .header("content-length", "5")
-                .header("content-length", "6")
-                .body(())
-                .unwrap();
-
-            let (response, mut req_body) = h2.send_request(request, false).unwrap();
-            req_body.reserve_capacity(5);
-            req_body.send_data("abcde".into(), true).unwrap();
-            let err = response.await.unwrap_err();
-            if let Some(reason) = err.reason() {
-                assert_eq!(reason, h2::Reason::PROTOCOL_ERROR);
+            let mut h2 = h2;
+            let mut refused = 0usize;
+            let mut last_err = None;
+            for _ in 0..LIMIT * 2 {
+                h2 = match h2.ready().await {
+                    Ok(h2) => h2,
+                    Err(e) => {
+                        last_err = Some(e);
+                        break;
+                    }
+                };
+                let (response, mut req_body) =
+                    match h2.send_request(conflicting_content_length_request(), false) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_err = Some(e);
+                            break;
+                        }
+                    };
+                req_body.reserve_capacity(5);
+                let _ = req_body.send_data("abcde".into(), true);
+                let err = response.await.unwrap_err();
+                if !err.is_reset() || err.reason() != Some(h2::Reason::PROTOCOL_ERROR) {
+                    // The connection went away (GOAWAY, or closed by the server).
+                    last_err = Some(err);
+                    break;
+                }
+                refused += 1;
             }
+            assert!(
+                last_err.is_some(),
+                "the connection outlived the reset limit"
+            );
+            assert_eq!(
+                refused, LIMIT,
+                "streams refused before the connection closed"
+            );
         });
 
-        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let mut options = default_h2_options();
+        options.max_local_error_reset_streams(Some(LIMIT));
+        let mut connection = handshake(Box::new(server), Some(options)).await.unwrap();
         let digest = Arc::new(Digest::default());
-        let mut malformed_streams = MAX_MALFORMED_STREAMS_PER_CONN - 1;
+        let mut malformed_streams = 0usize;
 
-        let err = match HttpSession::from_h2_conn_with_malformed_budget(
-            &mut connection,
-            digest,
-            &mut malformed_streams,
+        let err = match timeout(
+            Duration::from_secs(10),
+            HttpSession::from_h2_conn_with_malformed_budget(
+                &mut connection,
+                digest,
+                &mut malformed_streams,
+            ),
         )
         .await
+        .expect("from_h2_conn hung during the flood")
         {
-            Ok(Some(_)) => panic!("malformed request must not surface as a session"),
-            Ok(None) => panic!("connection ended before malformed budget was exhausted"),
+            Ok(Some(_)) => panic!("malformed request must not surface to the application"),
+            Ok(None) => panic!("connection ended cleanly instead of on the reset limit"),
             Err(err) => err,
         };
-
         assert_eq!(err.etype(), &ErrorType::H2Error);
-        assert_eq!(malformed_streams, MAX_MALFORMED_STREAMS_PER_CONN);
+        let cause = err
+            .root_cause()
+            .downcast_ref::<h2::Error>()
+            .expect("the error is caused by h2");
+        assert_eq!(cause.reason(), Some(h2::Reason::ENHANCE_YOUR_CALM));
+        assert_eq!(malformed_streams, 0, "h2 refused the streams, not Pingora");
 
         drop(connection);
         client_task.await.unwrap();

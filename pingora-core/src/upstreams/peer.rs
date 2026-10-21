@@ -566,47 +566,87 @@ pub struct PeerOptions {
 
 impl std::fmt::Debug for PeerOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Name every field so that adding one to `PeerOptions` fails to compile
+        // until it is either printed here or explicitly skipped.
+        let Self {
+            bind_to,
+            connection_timeout,
+            total_connection_timeout,
+            read_timeout,
+            idle_timeout,
+            write_timeout,
+            verify_cert,
+            verify_hostname,
+            #[cfg(feature = "s2n")]
+            use_system_certs,
+            alternative_cn,
+            alpn,
+            ca,
+            tcp_keepalive,
+            tcp_recv_buf,
+            dscp,
+            h2_ping_interval,
+            #[cfg(feature = "s2n")]
+            psk,
+            #[cfg(feature = "s2n")]
+            s2n_security_policy,
+            #[cfg(feature = "s2n")]
+            max_blinding_delay,
+            max_h2_streams,
+            h2_stream_window_size,
+            h2_connection_window_size,
+            allow_h1_response_invalid_content_length,
+            http_upstream_request_policy,
+            extra_proxy_headers,
+            curves,
+            second_keyshare,
+            tcp_fast_open,
+            tracer,
+            custom_l4,
+            // Hooks are closures without a `Debug` impl.
+            upstream_tcp_sock_tweak_hook: _,
+            proxy_digest_user_data_hook: _,
+            #[cfg(feature = "openssl_derived")]
+                upstream_tls_handshake_complete_hook: _,
+        } = self;
         let mut d = f.debug_struct("PeerOptions");
-        d.field("bind_to", &self.bind_to);
-        d.field("connection_timeout", &self.connection_timeout);
-        d.field("total_connection_timeout", &self.total_connection_timeout);
-        d.field("read_timeout", &self.read_timeout);
-        d.field("idle_timeout", &self.idle_timeout);
-        d.field("write_timeout", &self.write_timeout);
-        d.field("verify_cert", &self.verify_cert);
-        d.field("verify_hostname", &self.verify_hostname);
+        d.field("bind_to", bind_to);
+        d.field("connection_timeout", connection_timeout);
+        d.field("total_connection_timeout", total_connection_timeout);
+        d.field("read_timeout", read_timeout);
+        d.field("idle_timeout", idle_timeout);
+        d.field("write_timeout", write_timeout);
+        d.field("verify_cert", verify_cert);
+        d.field("verify_hostname", verify_hostname);
         #[cfg(feature = "s2n")]
-        d.field("use_system_certs", &self.use_system_certs);
-        d.field("alternative_cn", &self.alternative_cn);
-        d.field("alpn", &self.alpn);
-        d.field("ca", &self.ca);
-        d.field("tcp_keepalive", &self.tcp_keepalive);
-        d.field("tcp_recv_buf", &self.tcp_recv_buf);
-        d.field("dscp", &self.dscp);
-        d.field("h2_ping_interval", &self.h2_ping_interval);
+        d.field("use_system_certs", use_system_certs);
+        d.field("alternative_cn", alternative_cn);
+        d.field("alpn", alpn);
+        d.field("ca", ca);
+        d.field("tcp_keepalive", tcp_keepalive);
+        d.field("tcp_recv_buf", tcp_recv_buf);
+        d.field("dscp", dscp);
+        d.field("h2_ping_interval", h2_ping_interval);
         #[cfg(feature = "s2n")]
-        d.field("psk", &self.psk);
+        d.field("psk", psk);
         #[cfg(feature = "s2n")]
-        d.field("s2n_security_policy", &self.s2n_security_policy);
+        d.field("s2n_security_policy", s2n_security_policy);
         #[cfg(feature = "s2n")]
-        d.field("max_blinding_delay", &self.max_blinding_delay);
-        d.field("max_h2_streams", &self.max_h2_streams);
-        d.field("h2_stream_window_size", &self.h2_stream_window_size);
-        d.field("h2_connection_window_size", &self.h2_connection_window_size);
+        d.field("max_blinding_delay", max_blinding_delay);
+        d.field("max_h2_streams", max_h2_streams);
+        d.field("h2_stream_window_size", h2_stream_window_size);
+        d.field("h2_connection_window_size", h2_connection_window_size);
         d.field(
             "allow_h1_response_invalid_content_length",
-            &self.allow_h1_response_invalid_content_length,
+            allow_h1_response_invalid_content_length,
         );
-        d.field(
-            "http_upstream_request_policy",
-            &self.http_upstream_request_policy,
-        );
-        d.field("extra_proxy_headers", &self.extra_proxy_headers);
-        d.field("curves", &self.curves);
-        d.field("second_keyshare", &self.second_keyshare);
-        d.field("tcp_fast_open", &self.tcp_fast_open);
-        d.field("tracer", &self.tracer);
-        d.field("custom_l4", &self.custom_l4);
+        d.field("http_upstream_request_policy", http_upstream_request_policy);
+        d.field("extra_proxy_headers", extra_proxy_headers);
+        d.field("curves", curves);
+        d.field("second_keyshare", second_keyshare);
+        d.field("tcp_fast_open", tcp_fast_open);
+        d.field("tracer", tracer);
+        d.field("custom_l4", custom_l4);
         d.finish()
     }
 }

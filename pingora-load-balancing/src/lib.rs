@@ -179,17 +179,29 @@ pub struct Backend {
     pub ext: Extensions,
 }
 
-// `ext` is ignored by `Hash`, `PartialEq`, `PartialOrd` and `Ord`.
+// `ext` is ignored by `Hash`, `PartialEq`, `PartialOrd` and `Ord`. Each impl names
+// every field so that adding one to `Backend` fails to compile until it is
+// either compared or explicitly skipped here.
 impl Hash for Backend {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.addr.hash(state);
-        self.weight.hash(state);
+        let Self {
+            addr,
+            weight,
+            ext: _,
+        } = self;
+        addr.hash(state);
+        weight.hash(state);
     }
 }
 
 impl PartialEq for Backend {
     fn eq(&self, other: &Self) -> bool {
-        self.addr == other.addr && self.weight == other.weight
+        let Self {
+            addr,
+            weight,
+            ext: _,
+        } = self;
+        *addr == other.addr && *weight == other.weight
     }
 }
 
@@ -203,9 +215,13 @@ impl PartialOrd for Backend {
 
 impl Ord for Backend {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.addr
-            .cmp(&other.addr)
-            .then_with(|| self.weight.cmp(&other.weight))
+        let Self {
+            addr,
+            weight,
+            ext: _,
+        } = self;
+        addr.cmp(&other.addr)
+            .then_with(|| weight.cmp(&other.weight))
     }
 }
 

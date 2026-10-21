@@ -31,7 +31,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufStream, ReadBuf};
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, ReadBuf};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -369,11 +369,11 @@ pub const DEFAULT_L4_READ_BUFFER_SIZE: usize = 64 * 1024;
 /// similar to Nagle's algorithm, but user space can control when to flush.
 pub const DEFAULT_L4_WRITE_BUFFER_SIZE: usize = 1460;
 
-/// L4 [`BufStream`] buffer sizing.
+/// L4 read and write buffer sizing.
 ///
 /// Leaving either side as `None` preserves Pingora's default for that side.
-/// Setting either side to `Some(0)` disables `BufStream` buffering for that
-/// direction.
+/// Setting either side to `Some(0)` disables buffering for that direction:
+/// reads and writes then go straight to the socket.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct L4BufferSettings {
     /// Read buffer size in bytes. `None` uses [`DEFAULT_L4_READ_BUFFER_SIZE`].
@@ -391,7 +391,7 @@ impl L4BufferSettings {
         }
     }
 
-    /// Create settings that disable both read and write `BufStream` buffering.
+    /// Create settings that disable both read and write buffering.
     pub fn unbuffered() -> Self {
         Self::new(0, 0)
     }
@@ -419,6 +419,221 @@ impl L4BufferSettings {
     }
 }
 
+/// The write half of the buffering layer: either straight to the socket or
+/// through a [`BufWriter`] with a non-zero capacity.
+///
+/// Reads always pass straight through to the socket.
+#[derive(Debug)]
+enum WriteLayer {
+    Direct(RawStreamWrapper),
+    Buffered(BufWriter<RawStreamWrapper>),
+}
+
+impl WriteLayer {
+    fn with_capacity(capacity: usize, raw: RawStreamWrapper) -> Self {
+        if capacity == 0 {
+            WriteLayer::Direct(raw)
+        } else {
+            WriteLayer::Buffered(BufWriter::with_capacity(capacity, raw))
+        }
+    }
+
+    fn get_ref(&self) -> &RawStreamWrapper {
+        match self {
+            WriteLayer::Direct(s) => s,
+            WriteLayer::Buffered(s) => s.get_ref(),
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut RawStreamWrapper {
+        match self {
+            WriteLayer::Direct(s) => s,
+            WriteLayer::Buffered(s) => s.get_mut(),
+        }
+    }
+
+    /// Resize the write buffer. Bytes still waiting in the current buffer are
+    /// never dropped: while any are pending, the current buffer is kept (a
+    /// later flush drains it) and the new capacity is not applied.
+    fn resize(self, capacity: usize) -> Self {
+        match self {
+            WriteLayer::Buffered(w) if !w.buffer().is_empty() => WriteLayer::Buffered(w),
+            WriteLayer::Buffered(w) => WriteLayer::with_capacity(capacity, w.into_inner()),
+            WriteLayer::Direct(raw) => WriteLayer::with_capacity(capacity, raw),
+        }
+    }
+}
+
+impl AsyncRead for WriteLayer {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match Pin::into_inner(self) {
+            WriteLayer::Direct(s) => Pin::new(s).poll_read(cx, buf),
+            WriteLayer::Buffered(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for WriteLayer {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match Pin::into_inner(self) {
+            WriteLayer::Direct(s) => Pin::new(s).poll_write(cx, buf),
+            WriteLayer::Buffered(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        match Pin::into_inner(self) {
+            WriteLayer::Direct(s) => Pin::new(s).poll_flush(cx),
+            WriteLayer::Buffered(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        match Pin::into_inner(self) {
+            WriteLayer::Direct(s) => Pin::new(s).poll_shutdown(cx),
+            WriteLayer::Buffered(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::into_inner(self) {
+            WriteLayer::Direct(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            WriteLayer::Buffered(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            WriteLayer::Direct(s) => s.is_write_vectored(),
+            WriteLayer::Buffered(s) => s.is_write_vectored(),
+        }
+    }
+}
+
+/// The buffering layer between [`Stream`] and the socket.
+///
+/// A new stream does no buffering in either direction ([`BufferedIo::direct`]):
+/// buffers are only allocated by [`Stream::set_buffer`], off the critical
+/// `accept()` path, and until then every read and write goes straight to the
+/// socket. That matters for whatever runs before the buffers are set (PROXY
+/// protocol parsing, `peek`, a TLS `ClientHello` inspection): a read never pulls
+/// more bytes off the socket than it asks for, and a write needs no flush.
+///
+/// A zero size in [`L4BufferSettings`] means the same pass-through for that
+/// direction. Zero is never handed to tokio's buffered types, which reject a
+/// zero-capacity read buffer.
+#[derive(Debug)]
+enum BufferedIo {
+    /// Reads go straight to the socket.
+    DirectRead(WriteLayer),
+    /// Reads go through a [`BufReader`] with a non-zero capacity.
+    BufferedRead(BufReader<WriteLayer>),
+}
+
+impl BufferedIo {
+    /// No buffering in either direction, and no allocation.
+    fn direct(raw: RawStreamWrapper) -> Self {
+        BufferedIo::DirectRead(WriteLayer::Direct(raw))
+    }
+
+    fn get_ref(&self) -> &RawStreamWrapper {
+        match self {
+            BufferedIo::DirectRead(w) => w.get_ref(),
+            BufferedIo::BufferedRead(r) => r.get_ref().get_ref(),
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut RawStreamWrapper {
+        match self {
+            BufferedIo::DirectRead(w) => w.get_mut(),
+            BufferedIo::BufferedRead(r) => r.get_mut().get_mut(),
+        }
+    }
+
+    /// Rebuild with new buffer sizes. Returns the rebuilt layer and the bytes
+    /// that were read from the socket into the old read buffer but not yet
+    /// consumed; the caller must replay them before anything read later.
+    fn resize(self, buffer: L4BufferSettings) -> (Self, Vec<u8>) {
+        let (write_layer, unread) = match self {
+            BufferedIo::DirectRead(w) => (w, Vec::new()),
+            BufferedIo::BufferedRead(r) => {
+                let unread = r.buffer().to_vec();
+                (r.into_inner(), unread)
+            }
+        };
+        let write_layer = write_layer.resize(buffer.write_capacity());
+        let read_capacity = buffer.read_capacity();
+        let io = if read_capacity == 0 {
+            BufferedIo::DirectRead(write_layer)
+        } else {
+            BufferedIo::BufferedRead(BufReader::with_capacity(read_capacity, write_layer))
+        };
+        (io, unread)
+    }
+}
+
+impl AsyncRead for BufferedIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match Pin::into_inner(self) {
+            BufferedIo::DirectRead(s) => Pin::new(s).poll_read(cx, buf),
+            BufferedIo::BufferedRead(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for BufferedIo {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match Pin::into_inner(self) {
+            BufferedIo::DirectRead(s) => Pin::new(s).poll_write(cx, buf),
+            BufferedIo::BufferedRead(s) => Pin::new(s.get_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        match Pin::into_inner(self) {
+            BufferedIo::DirectRead(s) => Pin::new(s).poll_flush(cx),
+            BufferedIo::BufferedRead(s) => Pin::new(s.get_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        match Pin::into_inner(self) {
+            BufferedIo::DirectRead(s) => Pin::new(s).poll_shutdown(cx),
+            BufferedIo::BufferedRead(s) => Pin::new(s.get_mut()).poll_shutdown(cx),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::into_inner(self) {
+            BufferedIo::DirectRead(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            BufferedIo::BufferedRead(s) => Pin::new(s.get_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            BufferedIo::DirectRead(s) => s.is_write_vectored(),
+            BufferedIo::BufferedRead(s) => s.get_ref().is_write_vectored(),
+        }
+    }
+}
+
 // NOTE: with writer buffering, users need to call flush() to make sure the data is actually
 // sent. Otherwise data could be stuck in the buffer forever or get lost when stream is closed.
 
@@ -426,7 +641,7 @@ impl L4BufferSettings {
 #[derive(Debug)]
 pub struct Stream {
     // Use `Option` to be able to swap to adjust the buffer size. Always safe to unwrap
-    stream: Option<BufStream<RawStreamWrapper>>,
+    stream: Option<BufferedIo>,
     // the data put back at the front of the read buffer, in order to replay the read
     rewind_read_buf: Vec<Vec<u8>>,
     buffer_write: bool,
@@ -445,11 +660,11 @@ pub struct Stream {
 }
 
 impl Stream {
-    fn stream(&self) -> &BufStream<RawStreamWrapper> {
+    fn stream(&self) -> &BufferedIo {
         self.stream.as_ref().expect("stream should always be set")
     }
 
-    fn stream_mut(&mut self) -> &mut BufStream<RawStreamWrapper> {
+    fn stream_mut(&mut self) -> &mut BufferedIo {
         self.stream.as_mut().expect("stream should always be set")
     }
 
@@ -525,32 +740,27 @@ impl Stream {
         }
     }
 
-    /// Set the buffer of BufStream
+    /// Set the read and write buffer sizes (see [`BufferedIo`]).
     /// It is only set later because of the malloc overhead in critical accept() path
+    ///
+    /// No data is lost: bytes already in the read buffer are replayed after any
+    /// rewound data, and bytes waiting in the write buffer stay there until the
+    /// next flush.
     pub(crate) fn set_buffer(&mut self, buffer: L4BufferSettings) {
-        use std::mem;
-        // Since BufStream doesn't provide an API to adjust the buf directly,
-        // we take the raw stream out of it and put it in a new BufStream with the size we want
-        let stream = mem::take(&mut self.stream);
-        let stream = stream.map(|s| {
-            BufStream::with_capacity(
-                buffer.read_capacity(),
-                buffer.write_capacity(),
-                s.into_inner(),
-            )
-        });
-        let _ = mem::replace(&mut self.stream, stream);
+        let io = self.stream.take().expect("stream should always be set");
+        let (io, unread) = io.resize(buffer);
+        self.stream = Some(io);
+        if !unread.is_empty() {
+            // `rewind_read_buf` is read from the back: socket data goes last.
+            self.rewind_read_buf.insert(0, unread);
+        }
     }
 }
 
 impl From<TcpStream> for Stream {
     fn from(s: TcpStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
-                0,
-                0,
-                RawStreamWrapper::new(RawStream::Tcp(s)),
-            )),
+            stream: Some(BufferedIo::direct(RawStreamWrapper::new(RawStream::Tcp(s)))),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),
@@ -569,11 +779,9 @@ impl From<TcpStream> for Stream {
 impl From<virt::VirtualSocketStream> for Stream {
     fn from(s: virt::VirtualSocketStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
-                0,
-                0,
-                RawStreamWrapper::new(RawStream::Virtual(s)),
-            )),
+            stream: Some(BufferedIo::direct(RawStreamWrapper::new(
+                RawStream::Virtual(s),
+            ))),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),
@@ -593,11 +801,9 @@ impl From<virt::VirtualSocketStream> for Stream {
 impl From<UnixStream> for Stream {
     fn from(s: UnixStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
-                0,
-                0,
-                RawStreamWrapper::new(RawStream::Unix(s)),
-            )),
+            stream: Some(BufferedIo::direct(RawStreamWrapper::new(RawStream::Unix(
+                s,
+            )))),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),
@@ -892,22 +1098,29 @@ mod tests {
 
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            notify2.notified().await;
-            stream.write_all(message).await.unwrap();
+            loop {
+                notify2.notified().await;
+                stream.write_all(message).await.unwrap();
+            }
         });
 
         let mut stream: Stream = TcpStream::connect(addr).await.unwrap().into();
         stream.set_rx_timestamp().unwrap();
-        // Receive the message
-        // setsockopt for SO_TIMESTAMPING is asynchronous so sleep a little bit
-        // to let kernel do the work
-        std::thread::sleep(Duration::from_micros(100));
-        notify.notify_one();
-
+        // The kernel turns on software RX timestamping asynchronously after the
+        // setsockopt (a deferred static-key switch), so a packet received right
+        // after it may carry no timestamp, more often on a loaded machine. Send
+        // messages one at a time until a timestamp shows up, with a bound.
         let mut buffer = vec![0u8; message.len()];
-        let n = stream.read(buffer.as_mut_slice()).await.unwrap();
-        assert_eq!(n, message.len());
-        assert!(stream.rx_ts.is_some());
+        for _ in 0..100 {
+            notify.notify_one();
+            stream.read_exact(buffer.as_mut_slice()).await.unwrap();
+            assert_eq!(buffer, message);
+            if stream.rx_ts.is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no rx timestamp after 100 messages");
     }
 
     #[cfg(target_os = "linux")]
@@ -1045,5 +1258,218 @@ mod tests {
         let mut buffer = vec![];
         stream.read_to_end(&mut buffer).await.unwrap();
         assert_eq!(buffer, message[2..]);
+    }
+
+    /// A connected pair: the `Stream` under test and the raw peer socket.
+    fn unix_pair() -> (Stream, UnixStream) {
+        let (ours, peer) = UnixStream::pair().unwrap();
+        (Stream::from(ours), peer)
+    }
+
+    /// Read exactly `n` bytes from `peer`, failing if they don't arrive promptly.
+    async fn peer_read(peer: &mut UnixStream, n: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; n];
+        tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut buf))
+            .await
+            .expect("peer did not receive the bytes")
+            .unwrap();
+        buf
+    }
+
+    /// Assert that nothing reaches `peer` within a short window.
+    async fn peer_receives_nothing(peer: &mut UnixStream) {
+        let mut buf = [0u8; 1];
+        let res = tokio::time::timeout(Duration::from_millis(100), peer.read(&mut buf)).await;
+        assert!(res.is_err(), "peer unexpectedly received {res:?}");
+    }
+
+    // Before `set_buffer`, a stream does no buffering at all: it allocates no
+    // buffers on the accept path, and every write reaches the socket without a
+    // flush.
+    #[tokio::test]
+    async fn test_new_stream_writes_through_without_flush() {
+        let (mut stream, mut peer) = unix_pair();
+        stream.write_all(b"x").await.unwrap();
+        assert_eq!(peer_read(&mut peer, 1).await, b"x");
+
+        let bufs = [std::io::IoSlice::new(b"ab"), std::io::IoSlice::new(b"cd")];
+        let n = stream.write_vectored(&bufs).await.unwrap();
+        assert!(n > 0);
+        assert_eq!(peer_read(&mut peer, n).await, b"abcd"[..n]);
+    }
+
+    // Before `set_buffer`, reads go straight to the socket and never read
+    // ahead: a pre-TLS consumer (PROXY protocol, `peek`) takes exactly what it
+    // asks for, and the rest is still in the socket when the buffers are set.
+    #[tokio::test]
+    async fn test_new_stream_reads_do_not_read_ahead() {
+        let (mut stream, mut peer) = unix_pair();
+        peer.write_all(b"hello world").await.unwrap();
+
+        let mut one = [0u8; 1];
+        stream.read_exact(&mut one).await.unwrap();
+        assert_eq!(&one, b"h");
+
+        // Nothing was buffered inside `stream`: the raw socket still holds the rest.
+        let mut rest = [0u8; 10];
+        let raw = match &mut stream.stream_mut().get_mut().stream {
+            RawStream::Unix(s) => s,
+            other => panic!("unexpected raw stream {other:?}"),
+        };
+        raw.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"ello world");
+    }
+
+    #[tokio::test]
+    async fn test_set_buffer_unbuffered_writes_through() {
+        let (mut stream, mut peer) = unix_pair();
+        stream.set_buffer(L4BufferSettings::unbuffered());
+        stream.write_all(b"x").await.unwrap();
+        assert_eq!(peer_read(&mut peer, 1).await, b"x");
+
+        peer.write_all(b"pong").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+    }
+
+    #[tokio::test]
+    async fn test_set_buffer_default_holds_writes_until_flush() {
+        let (mut stream, mut peer) = unix_pair();
+        stream.set_buffer(L4BufferSettings::default());
+        stream.write_all(b"x").await.unwrap();
+        peer_receives_nothing(&mut peer).await;
+        stream.flush().await.unwrap();
+        assert_eq!(peer_read(&mut peer, 1).await, b"x");
+
+        // A write at least as large as the write buffer bypasses it.
+        let big = vec![7u8; DEFAULT_L4_WRITE_BUFFER_SIZE];
+        stream.write_all(&big).await.unwrap();
+        assert_eq!(peer_read(&mut peer, big.len()).await, big);
+    }
+
+    // A zero read buffer with a non-zero write buffer: reads are direct, writes
+    // are buffered.
+    #[tokio::test]
+    async fn test_set_buffer_zero_read_buffered_write() {
+        let (mut stream, mut peer) = unix_pair();
+        stream.set_buffer(L4BufferSettings::default().read(0));
+
+        peer.write_all(b"hello").await.unwrap();
+        let mut one = [0u8; 1];
+        stream.read_exact(&mut one).await.unwrap();
+        let mut rest = [0u8; 4];
+        let raw = match &mut stream.stream_mut().get_mut().stream {
+            RawStream::Unix(s) => s,
+            other => panic!("unexpected raw stream {other:?}"),
+        };
+        raw.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"ello");
+
+        stream.write_all(b"x").await.unwrap();
+        peer_receives_nothing(&mut peer).await;
+        stream.flush().await.unwrap();
+        assert_eq!(peer_read(&mut peer, 1).await, b"x");
+    }
+
+    // A zero write buffer with a non-zero read buffer: writes go through.
+    #[tokio::test]
+    async fn test_set_buffer_buffered_read_zero_write() {
+        let (mut stream, mut peer) = unix_pair();
+        stream.set_buffer(L4BufferSettings::default().write(0));
+        stream.write_all(b"x").await.unwrap();
+        assert_eq!(peer_read(&mut peer, 1).await, b"x");
+
+        peer.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    // Bytes already pulled into the read buffer survive a later `set_buffer`,
+    // after any rewound data and in order.
+    #[tokio::test]
+    async fn test_set_buffer_keeps_buffered_read_data() {
+        let (mut stream, mut peer) = unix_pair();
+        stream.set_buffer(L4BufferSettings::default());
+        peer.write_all(b"hello world").await.unwrap();
+        drop(peer);
+
+        let mut one = [0u8; 1];
+        stream.read_exact(&mut one).await.unwrap();
+        assert_eq!(&one, b"h");
+        stream.rewind(b"H");
+
+        stream.set_buffer(L4BufferSettings::unbuffered());
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"Hello world");
+    }
+
+    // Bytes waiting in the write buffer survive a later `set_buffer`.
+    #[tokio::test]
+    async fn test_set_buffer_keeps_pending_write_data() {
+        let (mut stream, mut peer) = unix_pair();
+        stream.set_buffer(L4BufferSettings::default());
+        stream.write_all(b"x").await.unwrap();
+        stream.set_buffer(L4BufferSettings::new(1024, 4096));
+        stream.flush().await.unwrap();
+        assert_eq!(peer_read(&mut peer, 1).await, b"x");
+    }
+
+    #[tokio::test]
+    async fn test_peek_and_rewind_with_buffers() {
+        for settings in [
+            L4BufferSettings::default(),
+            L4BufferSettings::unbuffered(),
+            L4BufferSettings::default().read(0),
+        ] {
+            let (mut stream, mut peer) = unix_pair();
+            stream.set_buffer(settings);
+            peer.write_all(b"abcdef").await.unwrap();
+            drop(peer);
+
+            let mut peeked = [0u8; 3];
+            assert!(stream.try_peek(&mut peeked).await.unwrap());
+            assert_eq!(&peeked, b"abc", "{settings:?}");
+            stream.rewind(b"XY");
+
+            let mut all = Vec::new();
+            stream.read_to_end(&mut all).await.unwrap();
+            assert_eq!(all, b"XYabcdef", "{settings:?}");
+        }
+    }
+
+    // Dropping a stream makes a best-effort flush of its write buffer.
+    #[tokio::test]
+    async fn test_drop_flushes_write_buffer() {
+        let (mut stream, mut peer) = unix_pair();
+        stream.set_buffer(L4BufferSettings::default());
+        stream.write_all(b"bye").await.unwrap();
+        drop(stream);
+        let mut all = Vec::new();
+        peer.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all, b"bye");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_stream_set_buffer_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            s.write_all(&buf).await.unwrap();
+        });
+
+        let mut stream: Stream = TcpStream::connect(addr).await.unwrap().into();
+        stream.set_buffer(L4BufferSettings::default());
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        echo.await.unwrap();
     }
 }
