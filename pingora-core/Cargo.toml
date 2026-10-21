@@ -38,11 +38,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 h2 = { workspace = true }
-derivative.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 once_cell = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
+serde_norway = "0.9.42"
 strum = "0.26.2"
 strum_macros = "0.26.2"
 libc = "0.2.70"

@@ -26,7 +26,6 @@ use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
 use crate::utils::tls::{get_organization_unit, CertKey};
 use ahash::AHasher;
-use derivative::Derivative;
 use pingora_error::{
     ErrorType::{InternalError, SocketError},
     OrErr, Result,
@@ -494,8 +493,7 @@ pub enum H1UpgradePolicy {
 ///
 /// See [`Peer`] for the meaning of the fields
 #[non_exhaustive]
-#[derive(Clone, Derivative)]
-#[derivative(Debug)]
+#[derive(Clone)]
 pub struct PeerOptions {
     pub bind_to: Option<BindTo>,
     pub connection_timeout: Option<Duration>,
@@ -555,18 +553,62 @@ pub struct PeerOptions {
     pub tracer: Option<Tracer>,
     /// A custom L4 connector to use to establish new L4 connections
     pub custom_l4: Option<Arc<dyn L4Connect + Send + Sync>>,
-    #[derivative(Debug = "ignore")]
     pub upstream_tcp_sock_tweak_hook:
         Option<Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>>,
-    #[derivative(Debug = "ignore")]
     pub proxy_digest_user_data_hook: Option<ProxyDigestUserDataHook>,
     /// Hook that allows returning an optional `SslDigestExtension`.
     /// Any returned value will be saved into the `SslDigest`.
     ///
     /// Currently only enabled for openssl variants with meaningful `TlsRef`s.
     #[cfg(feature = "openssl_derived")]
-    #[derivative(Debug = "ignore")]
     pub upstream_tls_handshake_complete_hook: Option<HandshakeCompleteHook>,
+}
+
+impl std::fmt::Debug for PeerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("PeerOptions");
+        d.field("bind_to", &self.bind_to);
+        d.field("connection_timeout", &self.connection_timeout);
+        d.field("total_connection_timeout", &self.total_connection_timeout);
+        d.field("read_timeout", &self.read_timeout);
+        d.field("idle_timeout", &self.idle_timeout);
+        d.field("write_timeout", &self.write_timeout);
+        d.field("verify_cert", &self.verify_cert);
+        d.field("verify_hostname", &self.verify_hostname);
+        #[cfg(feature = "s2n")]
+        d.field("use_system_certs", &self.use_system_certs);
+        d.field("alternative_cn", &self.alternative_cn);
+        d.field("alpn", &self.alpn);
+        d.field("ca", &self.ca);
+        d.field("tcp_keepalive", &self.tcp_keepalive);
+        d.field("tcp_recv_buf", &self.tcp_recv_buf);
+        d.field("dscp", &self.dscp);
+        d.field("h2_ping_interval", &self.h2_ping_interval);
+        #[cfg(feature = "s2n")]
+        d.field("psk", &self.psk);
+        #[cfg(feature = "s2n")]
+        d.field("s2n_security_policy", &self.s2n_security_policy);
+        #[cfg(feature = "s2n")]
+        d.field("max_blinding_delay", &self.max_blinding_delay);
+        d.field("max_h2_streams", &self.max_h2_streams);
+        d.field("h2_stream_window_size", &self.h2_stream_window_size);
+        d.field("h2_connection_window_size", &self.h2_connection_window_size);
+        d.field(
+            "allow_h1_response_invalid_content_length",
+            &self.allow_h1_response_invalid_content_length,
+        );
+        d.field(
+            "http_upstream_request_policy",
+            &self.http_upstream_request_policy,
+        );
+        d.field("extra_proxy_headers", &self.extra_proxy_headers);
+        d.field("curves", &self.curves);
+        d.field("second_keyshare", &self.second_keyshare);
+        d.field("tcp_fast_open", &self.tcp_fast_open);
+        d.field("tracer", &self.tracer);
+        d.field("custom_l4", &self.custom_l4);
+        d.finish()
+    }
 }
 
 impl PeerOptions {
