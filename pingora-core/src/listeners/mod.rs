@@ -202,8 +202,8 @@ impl TransportStackBuilder {
 /// Configuration for one listening endpoint.
 ///
 /// This configures the endpoint address and endpoint-specific transport
-/// settings such as [`TcpSocketOptions`], [`TlsSettings`], and L4
-/// [`BufStream`](tokio::io::BufStream) buffer sizes.
+/// settings such as [`TcpSocketOptions`], [`TlsSettings`], and L4 read and
+/// write buffer sizes ([`L4BufferSettings`]).
 pub struct ListenerConfig {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
@@ -270,7 +270,7 @@ impl ListenerConfig {
         self
     }
 
-    /// Set L4 `BufStream` buffer sizes for this endpoint.
+    /// Set L4 read and write buffer sizes for this endpoint.
     pub fn l4_buffer(mut self, settings: L4BufferSettings) -> Self {
         self.l4_buffer = settings;
         self

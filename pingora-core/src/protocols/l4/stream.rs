@@ -523,9 +523,12 @@ impl AsyncWrite for WriteLayer {
 /// A new stream does no buffering in either direction ([`BufferedIo::direct`]):
 /// buffers are only allocated by [`Stream::set_buffer`], off the critical
 /// `accept()` path, and until then every read and write goes straight to the
-/// socket. That matters for whatever runs before the buffers are set (PROXY
-/// protocol parsing, `peek`, a TLS `ClientHello` inspection): a read never pulls
-/// more bytes off the socket than it asks for, and a write needs no flush.
+/// socket: a read never pulls more bytes off the socket than it asks for, and a
+/// write needs no flush. Accepted streams get their buffers in
+/// `UninitializedStream::handshake`, before the pre-TLS callback (PROXY
+/// protocol) and the TLS handshake run; those read through this `Stream`, so
+/// bytes read ahead into the buffer are not lost. Connector-side streams never
+/// call `set_buffer` and stay unbuffered.
 ///
 /// A zero size in [`L4BufferSettings`] means the same pass-through for that
 /// direction. Zero is never handed to tokio's buffered types, which reject a
@@ -1017,7 +1020,8 @@ impl AsyncWrite for Stream {
 
     fn is_write_vectored(&self) -> bool {
         if self.buffer_write {
-            self.stream().is_write_vectored() // it is true
+            // true through a write buffer; the socket's own answer when unbuffered
+            self.stream().is_write_vectored()
         } else {
             self.stream().get_ref().is_write_vectored()
         }
