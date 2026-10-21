@@ -65,11 +65,13 @@ const MAX_MALFORMED_STREAMS_PER_CONN: usize = 32;
 /// Build [`H2Options`] with bounded defaults for received requests.
 ///
 /// Use this as the starting point when customizing options to retain the default
-/// decoded header-list and concurrent-stream limits.
+/// decoded header-list and concurrent-stream limits, and the bound on locally
+/// reset (malformed) streams per connection.
 pub fn default_h2_options() -> H2Options {
     let mut options = H2Options::default();
     options.max_header_list_size(DEFAULT_MAX_HEADER_LIST_SIZE);
     options.max_concurrent_streams(DEFAULT_MAX_CONCURRENT_STREAMS);
+    options.max_local_error_reset_streams(Some(MAX_MALFORMED_STREAMS_PER_CONN));
     options
 }
 
@@ -966,6 +968,14 @@ mod test {
     use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
     use tokio::sync::oneshot;
     use tokio_stream::StreamExt;
+
+    #[test]
+    fn default_h2_options_bounds_local_error_resets() {
+        let debug = format!("{:?}", default_h2_options());
+        let expected =
+            format!("local_max_error_reset_streams: Some({MAX_MALFORMED_STREAMS_PER_CONN})");
+        assert!(debug.contains(&expected), "{debug}");
+    }
 
     async fn advertised_settings(options: Option<H2Options>) -> Settings {
         let (mut client, server) = duplex(65536);

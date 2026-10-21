@@ -453,12 +453,27 @@ impl WriteLayer {
     }
 
     /// Resize the write buffer. Bytes still waiting in the current buffer are
-    /// never dropped: while any are pending, the current buffer is kept (a
-    /// later flush drains it) and the new capacity is not applied.
+    /// never dropped: a non-blocking flush is tried first, and the new capacity
+    /// is applied once the buffer is empty. If the socket cannot take the bytes
+    /// right now, the current buffer is kept (a later flush drains it) and the
+    /// new capacity is not applied.
     fn resize(self, capacity: usize) -> Self {
         match self {
-            WriteLayer::Buffered(w) if !w.buffer().is_empty() => WriteLayer::Buffered(w),
-            WriteLayer::Buffered(w) => WriteLayer::with_capacity(capacity, w.into_inner()),
+            WriteLayer::Buffered(mut w) => {
+                if !w.buffer().is_empty() {
+                    let waker = futures::task::noop_waker();
+                    let mut cx = Context::from_waker(&waker);
+                    let flushed = Pin::new(&mut w).poll_flush(&mut cx);
+                    if !matches!(flushed, Poll::Ready(Ok(()))) || !w.buffer().is_empty() {
+                        debug!(
+                            "write buffer resize to {capacity} deferred: {} bytes still pending",
+                            w.buffer().len()
+                        );
+                        return WriteLayer::Buffered(w);
+                    }
+                }
+                WriteLayer::with_capacity(capacity, w.into_inner())
+            }
             WriteLayer::Direct(raw) => WriteLayer::with_capacity(capacity, raw),
         }
     }
@@ -647,7 +662,6 @@ pub struct Stream {
     stream: Option<BufferedIo>,
     // the data put back at the front of the read buffer, in order to replay the read
     rewind_read_buf: Vec<Vec<u8>>,
-    buffer_write: bool,
     proxy_digest: Option<Arc<ProxyDigest>>,
     socket_digest: Option<Arc<SocketDigest>>,
     /// When this connection is established
@@ -765,7 +779,6 @@ impl From<TcpStream> for Stream {
         Stream {
             stream: Some(BufferedIo::direct(RawStreamWrapper::new(RawStream::Tcp(s)))),
             rewind_read_buf: Vec::new(),
-            buffer_write: true,
             established_ts: SystemTime::now(),
             establishment_duration: None,
             offload_wait_duration: None,
@@ -786,7 +799,6 @@ impl From<virt::VirtualSocketStream> for Stream {
                 RawStream::Virtual(s),
             ))),
             rewind_read_buf: Vec::new(),
-            buffer_write: true,
             established_ts: SystemTime::now(),
             establishment_duration: None,
             offload_wait_duration: None,
@@ -808,7 +820,6 @@ impl From<UnixStream> for Stream {
                 s,
             )))),
             rewind_read_buf: Vec::new(),
-            buffer_write: true,
             established_ts: SystemTime::now(),
             establishment_duration: None,
             offload_wait_duration: None,
@@ -982,11 +993,7 @@ impl AsyncWrite for Stream {
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let result = if self.buffer_write {
-            Pin::new(&mut self.stream_mut()).poll_write(cx, buf)
-        } else {
-            Pin::new(&mut self.stream_mut().get_mut()).poll_write(cx, buf)
-        };
+        let result = Pin::new(&mut self.stream_mut()).poll_write(cx, buf);
         self.write_pending_time.poll_write_time(&result, buf.len());
         result
     }
@@ -1008,23 +1015,15 @@ impl AsyncWrite for Stream {
     ) -> Poll<io::Result<usize>> {
         let total_size = bufs.iter().fold(0, |acc, s| acc + s.len());
 
-        let result = if self.buffer_write {
-            Pin::new(&mut self.stream_mut()).poll_write_vectored(cx, bufs)
-        } else {
-            Pin::new(&mut self.stream_mut().get_mut()).poll_write_vectored(cx, bufs)
-        };
+        let result = Pin::new(&mut self.stream_mut()).poll_write_vectored(cx, bufs);
 
         self.write_pending_time.poll_write_time(&result, total_size);
         result
     }
 
     fn is_write_vectored(&self) -> bool {
-        if self.buffer_write {
-            // true through a write buffer; the socket's own answer when unbuffered
-            self.stream().is_write_vectored()
-        } else {
-            self.stream().get_ref().is_write_vectored()
-        }
+        // true through a write buffer; the socket's own answer when unbuffered
+        self.stream().is_write_vectored()
     }
 }
 
@@ -1475,5 +1474,18 @@ mod tests {
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
         echo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_unbuffer_with_pending_bytes_flushes_first() {
+        let (mut stream, mut peer) = unix_pair();
+        stream.set_buffer(L4BufferSettings::default());
+        stream.write_all(b"pending").await.unwrap();
+        // The bytes sit in the write buffer; asking for no buffering must
+        // not leave them there waiting for a flush that may never come.
+        stream.set_buffer(L4BufferSettings::unbuffered());
+        assert_eq!(peer_read(&mut peer, 7).await, b"pending");
+        stream.write_all(b"direct").await.unwrap();
+        assert_eq!(peer_read(&mut peer, 6).await, b"direct");
     }
 }
